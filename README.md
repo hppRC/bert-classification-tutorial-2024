@@ -406,6 +406,7 @@ email: [research.tsukagoshi.hayato@gmail.com](mailto:research.tsukagoshi.hayato@
 
 論文等で本実装を参照する場合は、以下をお使いください。
 
+
 ```bibtex
 @article{
   hayato-tsukagoshi-2023-bert-classification-tutorial,,

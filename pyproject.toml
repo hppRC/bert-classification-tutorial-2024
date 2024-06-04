@@ -1,23 +1,80 @@
-[tool.poetry]
+[project]
 name = "bert-classification-tutorial"
-version = "0.2.0"
-description = ""
-authors = ["hppRC <hpp.ricecake@gmail.com>"]
+version = "0.3.0"
+description = "Add your description here"
+authors = [{ name = "hppRC", email = "hpp.ricecake@gmail.com" }]
+dependencies = [
+    "torch==2.3.0+cu121",
+    "transformers[ja,sentencepiece]>=4.41.1",
+    "deepspeed>=0.14.2",
+    "tensorboard>=2.14.0",
+    "more-itertools>=10.2.0",
+    "scikit-learn>=1.3.2",
+    "datasets>=2.19.1",
+    "accelerate>=0.30.1",
+    "tokenizers>=0.19.1",
+    "pandas>=2.0.3",
+    "numpy>=1.26.3",
+    "tqdm>=4.64.1",
+]
 readme = "README.md"
-packages = [{ include = "src" }]
-
-[tool.poetry.dependencies]
-python = "3.10.x"
-torch = { url = "https://download.pytorch.org/whl/cu118/torch-2.0.1%2Bcu118-cp310-cp310-linux_x86_64.whl" }
-transformers = { extras = ["ja", "sentencepiece"], version = "^4.30.0" }
-numpy = "^1.25.0"
-pandas = "^2.0.3"
-more-itertools = "^9.1.0"
-scikit-learn = "^1.2.2"
-tqdm = "^4.65.0"
-typed-argument-parser = "^1.8.1"
-
+requires-python = ">= 3.8"
 
 [build-system]
-requires = ["poetry-core"]
-build-backend = "poetry.core.masonry.api"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.rye]
+managed = true
+dev-dependencies = [
+    "pip>=23.3.2",
+    "setuptools>=69.0.3",
+    "wheel>=0.42.0",
+    "ruff>=0.4.5",
+]
+
+[[tool.rye.sources]]
+name = "torch"
+url = "https://download.pytorch.org/whl/cu121"
+type = "index"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[tool.ruff]
+exclude = [
+    ".git",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".venv",
+    "outputs",
+    "datasets",
+    "prev",
+]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+fixable = ["ALL"]
+unfixable = []
+# https://qiita.com/yuji38kwmt/items/63e82126076204923520
+select = ["F", "E", "W", "I", "B", "PL", "UP", "N"]
+ignore = [
+    "PLR0913", # Too many arguments in function definition
+    "PLR2004", # Magic value used in comparison
+    "N812",    # Lowercase imported as non-lowercase
+    "N806",    # Lowercase imported as non-lowercase
+    "F403",    # unable to detect undefined names
+    "E501",    # Line too long
+    "N999",    # Invalid module name
+    "PLR0912", # too many branches
+    "B905",    # zip strict
+    "UP007",   # Use `X | Y` for type annotations
+]
+
+[tool.ruff.format]
+quote-style = "double"
+line-ending = "auto"

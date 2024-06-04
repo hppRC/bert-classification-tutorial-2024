@@ -1,218 +1,109 @@
-from datetime import datetime
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import torch
+import torch.utils.checkpoint
+from accelerate import Accelerator
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
-from tap import Tap
-from torch.utils.data import DataLoader
-from tqdm import tqdm, trange
 from transformers import (
     AutoModelForSequenceClassification,
     AutoTokenizer,
-    PreTrainedModel,
+    BatchEncoding,
+    EvalPrediction,
+    HfArgumentParser,
+    PreTrainedTokenizer,
+    TrainingArguments,
 )
-from transformers.modeling_outputs import SequenceClassifierOutput
-from transformers.optimization import get_linear_schedule_with_warmup
-from transformers.tokenization_utils import BatchEncoding, PreTrainedTokenizer
+from transformers import Trainer as HFTrainer
+from transformers.trainer_utils import PredictionOutput
 
-import src.utils as utils
+import datasets as ds
+from src import utils
 
 
-class Args(Tap):
+@dataclass
+class TrainingArgs(TrainingArguments):
+    output_dir: str = None
+
+    num_train_epochs: int = 20
+    learning_rate: float = 3e-5
+    per_device_train_batch_size: int = 32
+    weight_decay: float = 0.01
+    warmup_ratio: float = 0.1
+
+    dataloader_num_workers: int = 4
+    lr_scheduler_type: str = "cosine"
+
+    # 使用するデータ型、BF16を利用することで高速かつ省メモリで学習可能
+    # 一般にFP16よりBF16の方が学習が安定している
+    bf16: bool = True
+
+    # optimizerが持つ勾配情報を適宜再計算することで保持するメモリを削減するGradient Checkpointingの設定
+    gradient_checkpointing: bool = True
+    gradient_checkpointing_kwargs: dict = field(default_factory=lambda: {"use_reentrant": True})
+
+    # tensorboardで実験ログを残しておくとどんな感じで学習が進んでいるかわかって便利
+    report_to: str = "tensorboard"
+    logging_steps: int = 10
+    logging_dir: str = None
+
+    # 最良のモデルを選ぶ際に基準となる指標
+    metric_for_best_model: str = "loss"
+    greater_is_better: bool = False
+    # val accuracyを基準に選ぶ場合は以下のようにする
+    # metric_for_best_model: str = "acc"
+    # greater_is_better: bool = True
+
+    eval_strategy: str = "epoch"
+    per_device_eval_batch_size: int = 32
+
+    save_strategy: str = "epoch"
+    save_total_limit: int = 1
+
+    ddp_find_unused_parameters: bool = False
+    load_best_model_at_end: bool = False
+    remove_unused_columns: bool = False
+
+
+@dataclass
+class ExperimentConfig:
     model_name: str = "cl-tohoku/bert-base-japanese-v3"
     dataset_dir: Path = "./datasets/livedoor"
-
-    batch_size: int = 16
-    epochs: int = 20
-    lr: float = 3e-5
-    num_warmup_epochs: int = 2
+    experiment_name: str = "default"
     max_seq_len: int = 512
-    weight_decay: float = 0.01
-    gradient_checkpointing: bool = False
 
-    device: str = "cuda:0"
-    seed: int = 42
-
-    def process_args(self):
-        self.label2id: dict[str, int] = utils.load_json(self.dataset_dir / "label2id.json")
-        self.labels: list[int] = list(self.label2id.values())
-
-        date, time = datetime.now().strftime("%Y-%m-%d/%H-%M-%S.%f").split("/")
-        self.output_dir = self.make_output_dir(
-            "outputs",
-            self.model_name,
-            date,
-            time,
-        )
-
-    def make_output_dir(self, *args) -> Path:
-        args = [str(a).replace("/", "__") for a in args]
-        output_dir = Path(*args)
-        output_dir.mkdir(parents=True, exist_ok=True)
-        return output_dir
+    def __post_init__(self):
+        self.label2id = utils.load_json(self.dataset_dir / "label2id.json")
 
 
-class Experiment:
-    def __init__(self, args: Args):
-        self.args: Args = args
+@dataclass
+class DataCollator:
+    tokenizer: PreTrainedTokenizer
+    max_seq_len: int
 
-        self.tokenizer: PreTrainedTokenizer = AutoTokenizer.from_pretrained(
-            args.model_name,
-            model_max_length=args.max_seq_len,
-        )
-
-        self.model: PreTrainedModel = (
-            AutoModelForSequenceClassification.from_pretrained(
-                args.model_name,
-                num_labels=len(args.labels),
-            )
-            .eval()
-            .to(args.device, non_blocking=True)
-        )
-
-        # gradient_checkpointingとtorch.compileは相性が悪いことが多いので排他的に使用
-        if args.gradient_checkpointing:
-            self.model.gradient_checkpointing_enable()
-        else:
-            self.model = torch.compile(self.model)
-
-        self.train_dataloader: DataLoader = self.load_dataset(split="train", shuffle=True)
-        self.val_dataloader: DataLoader = self.load_dataset(split="val")
-        self.test_dataloader: DataLoader = self.load_dataset(split="test")
-
-        self.optimizer, self.lr_scheduler = self.create_optimizer()
-
-    def load_dataset(
-        self,
-        split: str,
-        shuffle: bool = False,
-    ) -> DataLoader:
-        path: Path = self.args.dataset_dir / f"{split}.jsonl"
-        dataset: list[dict] = utils.load_jsonl(path).to_dict(orient="records")
-        return self.create_loader(dataset, shuffle=shuffle)
-
-    def collate_fn(self, data_list: list[dict]) -> BatchEncoding:
+    def __call__(self, data_list: list[dict[str, Any]]) -> BatchEncoding:
         title = [d["title"] for d in data_list]
         body = [d["body"] for d in data_list]
-
         inputs: BatchEncoding = self.tokenizer(
             title,
             body,
             padding=True,
             truncation="only_second",
             return_tensors="pt",
-            max_length=args.max_seq_len,
+            max_length=self.max_seq_len,
         )
+        inputs["labels"] = torch.LongTensor([d["label"] for d in data_list])
+        return inputs
 
-        labels = torch.LongTensor([d["label"] for d in data_list])
-        return BatchEncoding({**inputs, "labels": labels})
 
-    def create_loader(
-        self,
-        dataset,
-        batch_size=None,
-        shuffle=False,
-    ):
-        return DataLoader(
-            dataset,
-            collate_fn=self.collate_fn,
-            batch_size=batch_size or args.batch_size,
-            shuffle=shuffle,
-            num_workers=4,
-            pin_memory=True,
-        )
+class ComputeMetrics:
+    def __init__(self, labels: list[str]):
+        self.labels = labels
 
-    def create_optimizer(self) -> tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR]:
-        # see: https://tma15.github.io/blog/2021/09/17/deep-learningbert%E5%AD%A6%E7%BF%92%E6%99%82%E3%81%ABbias%E3%82%84layer-normalization%E3%82%92weight-decay%E3%81%97%E3%81%AA%E3%81%84%E7%90%86%E7%94%B1/
-        no_decay = {"bias", "LayerNorm.weight"}
-        optimizer_grouped_parameters = [
-            {
-                "params": [
-                    param for name, param in self.model.named_parameters() if not name in no_decay
-                ],
-                "weight_decay": self.args.weight_decay,
-            },
-            {
-                "params": [
-                    param for name, param in self.model.named_parameters() if name in no_decay
-                ],
-                "weight_decay": 0.0,
-            },
-        ]
-
-        optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=self.args.lr)
-
-        lr_scheduler = get_linear_schedule_with_warmup(
-            optimizer=optimizer,
-            num_warmup_steps=len(self.train_dataloader) * args.num_warmup_epochs,
-            num_training_steps=len(self.train_dataloader) * args.epochs,
-        )
-
-        return optimizer, lr_scheduler
-
-    @torch.cuda.amp.autocast(dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else None)
-    def run(self):
-        val_metrics = {"epoch": None, **self.evaluate(self.val_dataloader)}
-        best_epoch, best_val_f1 = None, val_metrics["f1"]
-        best_state_dict = self.clone_state_dict()
-        self.log(val_metrics)
-
-        scaler = torch.cuda.amp.GradScaler()
-
-        for epoch in trange(args.epochs, dynamic_ncols=True):
-            self.model.train()
-
-            for batch in tqdm(
-                self.train_dataloader,
-                total=len(self.train_dataloader),
-                dynamic_ncols=True,
-                leave=False,
-            ):
-                out: SequenceClassifierOutput = self.model(**batch.to(args.device))
-                loss: torch.FloatTensor = out.loss
-
-                self.optimizer.zero_grad()
-                scaler.scale(loss).backward()
-                scaler.step(self.optimizer)
-
-                scale = scaler.get_scale()
-                scaler.update()
-                if scale <= scaler.get_scale():
-                    self.lr_scheduler.step()
-
-            self.model.eval()
-            val_metrics = {"epoch": epoch, **self.evaluate(self.val_dataloader)}
-            self.log(val_metrics)
-
-            # 開発セットでのF値最良時のモデルを保存
-            if val_metrics["f1"] > best_val_f1:
-                best_val_f1 = val_metrics["f1"]
-                best_epoch = epoch
-                best_state_dict = self.clone_state_dict()
-
-        self.model.load_state_dict(best_state_dict)
-        self.model.eval().to(args.device, non_blocking=True)
-
-        val_metrics = {"best-epoch": best_epoch, **self.evaluate(self.val_dataloader)}
-        test_metrics = self.evaluate(self.test_dataloader)
-
-        return val_metrics, test_metrics
-
-    @torch.no_grad()
-    @torch.cuda.amp.autocast(dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else None)
-    def evaluate(self, dataloader: DataLoader) -> dict[str, float]:
-        self.model.eval()
-        total_loss, gold_labels, pred_labels = 0, [], []
-
-        for batch in tqdm(dataloader, total=len(dataloader), dynamic_ncols=True, leave=False):
-            out: SequenceClassifierOutput = self.model(**batch.to(self.args.device))
-
-            batch_size: int = batch.input_ids.size(0)
-            loss = out.loss.item() * batch_size
-            total_loss += loss
-
-            pred_labels += out.logits.argmax(dim=-1).tolist()
-            gold_labels += batch.labels.tolist()
+    def __call__(self, eval_pred: EvalPrediction):
+        pred_labels = torch.Tensor(eval_pred.predictions.argmax(axis=1).reshape(-1))
+        gold_labels = torch.Tensor(eval_pred.label_ids.reshape(-1))
 
         accuracy: float = accuracy_score(gold_labels, pred_labels)
         precision, recall, f1, _ = precision_recall_fscore_support(
@@ -220,42 +111,101 @@ class Experiment:
             pred_labels,
             average="macro",
             zero_division=0,
-            labels=args.labels,
+            labels=self.labels,
         )
 
         return {
-            "loss": loss / len(dataloader.dataset),
             "accuracy": accuracy,
             "precision": precision,
             "recall": recall,
             "f1": f1,
         }
 
-    def log(self, metrics: dict) -> None:
-        utils.log(metrics, self.args.output_dir / "log.csv")
-        tqdm.write(
-            f"epoch: {metrics['epoch']} \t"
-            f"loss: {metrics['loss']:2.6f}   \t"
-            f"accuracy: {metrics['accuracy']:.4f} \t"
-            f"precision: {metrics['precision']:.4f} \t"
-            f"recall: {metrics['recall']:.4f} \t"
-            f"f1: {metrics['f1']:.4f}"
-        )
 
-    def clone_state_dict(self) -> dict:
-        return {k: v.detach().clone().cpu() for k, v in self.model.state_dict().items()}
+def main(training_args: TrainingArgs, config: ExperimentConfig):
+    tokenizer: PreTrainedTokenizer = AutoTokenizer.from_pretrained(config.model_name)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.unk_token_id
+    tokenizer.add_eos_token = True
+
+    model = AutoModelForSequenceClassification.from_pretrained(
+        config.model_name,
+        num_labels=len(config.label2id),
+        label2id=config.label2id,
+        id2label={v: k for k, v in config.label2id.items()},
+        pad_token_id=tokenizer.pad_token_id,
+        use_cache=False,
+    )
+
+    datasets: ds.DatasetDict = ds.load_from_disk(str(config.dataset_dir))
+
+    data_collator = DataCollator(
+        tokenizer=tokenizer,
+        max_seq_len=config.max_seq_len,
+    )
+
+    compute_metrics = ComputeMetrics(labels=list(config.label2id.values()))
+
+    trainer = HFTrainer(
+        args=training_args,
+        model=model,
+        tokenizer=tokenizer,
+        train_dataset=datasets["train"],
+        eval_dataset=datasets["validation"],
+        data_collator=data_collator,
+        compute_metrics=compute_metrics,
+    )
+
+    trainer.train()
+    trainer._load_best_model()
+
+    trainer.save_model()
+    trainer.save_state()
+    trainer.tokenizer.save_pretrained(training_args.output_dir)
+
+    # 最良のモデルを使ってval set, test setで評価
+    val_prediction_output: PredictionOutput = trainer.predict(test_dataset=datasets["validation"])
+    test_prediction_output: PredictionOutput = trainer.predict(test_dataset=datasets["test"])
+
+    if training_args.process_index == 0:
+        val_metrics: dict[str, float] = val_prediction_output.metrics
+        val_metrics = {k.replace("test_", ""): v for k, v in val_metrics.items()}
+
+        test_metrics: dict[str, float] = test_prediction_output.metrics
+        test_metrics = {k.replace("test_", ""): v for k, v in test_metrics.items()}
+
+        metrics = {
+            "best-val": val_metrics,
+            "test": test_metrics,
+        }
+
+        utils.save_json(metrics, Path(training_args.output_dir, "metrics.json"))
+
+        with Path(training_args.output_dir, "training_args.json").open("w") as f:
+            f.write(trainer.args.to_json_string())
 
 
-def main(args: Args):
-    exp = Experiment(args=args)
-    val_metrics, test_metrics = exp.run()
-
-    utils.save_json(val_metrics, args.output_dir / "val-metrics.json")
-    utils.save_json(test_metrics, args.output_dir / "test-metrics.json")
-    utils.save_config(args, args.output_dir / "config.json")
+def summarize_config(training_args: TrainingArgs, config: ExperimentConfig) -> str:
+    accelerator = Accelerator()
+    batch_size = training_args.per_device_train_batch_size * accelerator.num_processes
+    config_summary = {
+        "B": batch_size,
+        "E": training_args.num_train_epochs,
+        "LR": training_args.learning_rate,
+        "L": config.max_seq_len,
+    }
+    config_summary = "".join(f"{k}{v}" for k, v in config_summary.items())
+    return config_summary
 
 
 if __name__ == "__main__":
-    args = Args().parse_args()
-    utils.init(seed=args.seed)
-    main(args)
+    parser = HfArgumentParser((TrainingArgs, ExperimentConfig))
+    training_args, config = parser.parse_args_into_dataclasses()
+    config_summary = summarize_config(training_args, config)
+    model_name = config.model_name.replace("/", "__")
+
+    training_args.output_dir = f"outputs/{model_name}/{config_summary}/{config.experiment_name}"
+    training_args.logging_dir = training_args.output_dir
+    training_args.run_name = f"{config_summary}/{config.experiment_name}"
+
+    main(training_args, config)
