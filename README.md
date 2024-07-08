@@ -30,7 +30,8 @@ accelerate launch --config_file config/4-ds.json src/train.py --model_name tohok
 - `config`ディレクトリに`accelerate`利用時のconfigファイルを保存してあります
   - `4-ds.json`は4GPU+DeepSpeedを利用する場合の設定ファイルです
   - `1.json`は1GPUのみ利用する場合の設定ファイルです
-
+  - `accelerate config --config_file config/hoge.json`を実行することでお好みの設定ファイルを対話的に作成することができます
+- `tensorboard --logdir ./outputs`を実行することでTensorBoardを利用して学習の進捗を確認することができます
 
 ## おわりに
 
